@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FastAPI 入口：REST + SSE（文档第 10 节 API）。"""
+"""FastAPI 入口：REST + SSE。"""
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +7,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -30,7 +30,7 @@ logger = logging.getLogger("adaptive-tutor")
 
 LLM_MODE = config.LLM_PROVIDER
 if not config.OPENAI_API_KEY and LLM_MODE != "deterministic":
-    logger.warning("未配置 OPENAI_API_KEY，使用确定性降级模式（无 LLM）；配置后自动切换 OpenAI Agents SDK。")
+    logger.warning("未配置 OPENAI_API_KEY，使用确定性降级模式。")
 
 
 @asynccontextmanager
@@ -39,7 +39,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="LLM 一对一自适应教学系统", version="0.1", lifespan=lifespan)
+app = FastAPI(title="LLM 一对一自适应教学系统", version="0.2", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,28 +50,23 @@ app.add_middleware(
 )
 
 
-# ---------------- Schemas ----------------
-
 class StartRequest(BaseModel):
-    goal: str = Field(default="学习微积分", description="学习目标")
-    subject: str = Field(default="math")
+    goal: str = Field(default="学习微积分", min_length=1, max_length=500)
+    subject: str = Field(default="math", min_length=1, max_length=64)
 
 
 class AnswerRequest(BaseModel):
-    question_id: str
+    question_id: str = Field(min_length=1, max_length=64)
     answer: int = Field(ge=0, le=3)
 
 
 class MessageRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=10000)
 
-
-# ---------------- API ----------------
 
 @app.post("/api/learning/start")
 def start(req: StartRequest, db: DbSession = Depends(get_db)):
-    """创建 session + 返回第一道诊断题。"""
-    session = loop.start_session(db, req.goal, req.subject)
+    session = loop.start_session(db, req.goal.strip(), req.subject.strip())
     question = loop.next_diagnostic_question(db, session)
     db.refresh(session)
     return {
@@ -85,16 +80,12 @@ def start(req: StartRequest, db: DbSession = Depends(get_db)):
 
 @app.get("/api/learning/{session_id}")
 def get_session(session_id: str, db: DbSession = Depends(get_db)):
-    """session 状态 + 当前题（如果存在）。"""
     try:
         session = get_or_404(db, session_id)
     except KeyError:
         raise HTTPException(404, "session not found")
-    question_dict = None
-    if session.current_question_id:
-        q = db.get(Question, session.current_question_id)
-        if q is not None:
-            question_dict = _qdict(q)
+
+    question = db.get(Question, session.current_question_id) if session.current_question_id else None
     return {
         "session_id": session.id,
         "stage": session.stage,
@@ -102,7 +93,7 @@ def get_session(session_id: str, db: DbSession = Depends(get_db)):
         "subject": session.subject,
         "current_node_id": session.current_node_id,
         "current_question_id": session.current_question_id,
-        "question": question_dict,
+        "question": _qdict(question) if question else None,
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "updated_at": session.updated_at.isoformat() if session.updated_at else None,
     }
@@ -110,51 +101,53 @@ def get_session(session_id: str, db: DbSession = Depends(get_db)):
 
 @app.get("/api/learning/{session_id}/map")
 def get_map(session_id: str, db: DbSession = Depends(get_db)):
-    """知识地图（Mermaid 数据接口，文档第 16 节）。"""
     session = db.get(LearningSession, session_id)
     if session is None:
         raise HTTPException(404, "session not found")
 
     nodes = db.query(KnowledgeNode).filter(KnowledgeNode.subject == session.subject).all()
+    node_ids = {node.id for node in nodes}
     edges = db.query(KnowledgeEdge).filter(
-        (KnowledgeEdge.source_id.in_([n.id for n in nodes])) |
-        (KnowledgeEdge.target_id.in_([n.id for n in nodes]))
+        KnowledgeEdge.source_id.in_(node_ids),
+        KnowledgeEdge.target_id.in_(node_ids),
     ).all()
-
     states = {
-        s.node_id: s for s in
-        db.query(LearnerState).filter(LearnerState.session_id == session_id).all()
+        state.node_id: state
+        for state in db.query(LearnerState).filter(LearnerState.session_id == session_id).all()
     }
+
     node_list = []
-    for n in nodes:
-        st = states.get(n.id)
-        # 只有有答题证据（evidence_count > 0）的节点才算已测；
-        # 否则 mastery=None，状态为未测（灰色 none）
-        mastery = st.overall if st and st.evidence_count > 0 else None
-        status = "none" if mastery is None else mastery_level(mastery)
+    for node in nodes:
+        state = states.get(node.id)
+        mastery = state.overall if state and state.evidence_count > 0 else None
         node_list.append({
-            "id": n.id, "title": n.title, "description": n.description,
-            "difficulty": n.difficulty, "importance": n.importance,
-            "mastery": mastery, "status": status,
+            "id": node.id,
+            "title": node.title,
+            "description": node.description,
+            "difficulty": node.difficulty,
+            "importance": node.importance,
+            "mastery": mastery,
+            "status": "none" if mastery is None else mastery_level(mastery),
         })
-    edge_list = [
-        {"source": e.source_id, "target": e.target_id, "relation": e.relation}
-        for e in edges
-    ]
-    return {"nodes": node_list, "edges": edge_list}
+
+    return {
+        "nodes": node_list,
+        "edges": [
+            {"source": edge.source_id, "target": edge.target_id, "relation": edge.relation}
+            for edge in edges
+        ],
+    }
 
 
 @app.post("/api/learning/{session_id}/answer")
 def answer(session_id: str, req: AnswerRequest, db: DbSession = Depends(get_db)):
-    """提交诊断/后测答案。"""
     try:
         session = get_or_404(db, session_id)
-    except KeyError:
-        raise HTTPException(404, "session not found")
-    try:
         result = loop.submit_answer(db, session, req.question_id, req.answer)
     except KeyError as exc:
         raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return {
         "correct": result["correct"],
         "stage": result["stage"],
@@ -164,68 +157,72 @@ def answer(session_id: str, req: AnswerRequest, db: DbSession = Depends(get_db))
 
 @app.post("/api/learning/{session_id}/message")
 async def message(session_id: str, req: MessageRequest, db: DbSession = Depends(get_db)):
-    """教学对话（SSE 流式）。"""
     try:
         session = get_or_404(db, session_id)
+        # TutorAgent 当前接口为同步调用；在线程池中执行，避免在 async endpoint 中嵌套 asyncio.run。
+        result = await asyncio.to_thread(loop.tutor_message, db, session, req.message.strip())
     except KeyError:
         raise HTTPException(404, "session not found")
-    try:
-        result = loop.tutor_message(db, session, req.message)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    except Exception as exc:
+        logger.exception("tutor message failed")
+        raise HTTPException(502, f"tutor generation failed: {exc}")
 
     async def event_stream():
         content = result["content"]
-        # 模拟流式分块
-        chunk_size = 24
-        for i in range(0, len(content), chunk_size):
-            chunk = content[i:i + chunk_size]
+        chunk_size = 48
+        for start in range(0, len(content), chunk_size):
+            chunk = content[start:start + chunk_size]
             yield f"data: {json.dumps({'type': 'token', 'content': chunk}, ensure_ascii=False)}\n\n"
             await asyncio.sleep(0.01)
         yield f"data: {json.dumps({'type': 'done', 'intent': result['intent'], 'node_id': result['node_id']}, ensure_ascii=False)}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/learning/{session_id}/start-assessment")
 def start_assessment(session_id: str, db: DbSession = Depends(get_db)):
-    """启动后测。"""
     try:
         session = get_or_404(db, session_id)
+        question = loop.start_assessment(db, session)
     except KeyError:
         raise HTTPException(404, "session not found")
-    try:
-        q = loop.start_assessment(db, session)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    return {"stage": session.stage, "question": _qdict(q) if q else None}
+    return {"stage": session.stage, "question": _qdict(question) if question else None}
 
 
 @app.get("/api/learning/{session_id}/progress")
 def progress(session_id: str, db: DbSession = Depends(get_db)):
-    """学习进度：当前节点、掌握度、各节点状态。"""
     session = db.get(LearningSession, session_id)
     if session is None:
         raise HTTPException(404, "session not found")
 
     nodes = db.query(KnowledgeNode).filter(KnowledgeNode.subject == session.subject).all()
     states = {
-        s.node_id: s for s in
-        db.query(LearnerState).filter(LearnerState.session_id == session_id).all()
+        state.node_id: state
+        for state in db.query(LearnerState).filter(LearnerState.session_id == session_id).all()
     }
     node_progress = []
-    for n in nodes:
-        st = states.get(n.id)
+    for node in nodes:
+        state = states.get(node.id)
+        tested = bool(state and state.evidence_count > 0)
         node_progress.append({
-            "node_id": n.id,
-            "title": n.title,
-            "conceptual": st.conceptual if st else 0.0,
-            "procedural": st.procedural if st else 0.0,
-            "transfer": st.transfer if st else 0.0,
-            "overall": st.overall if st else 0.0,
-            "evidence_count": st.evidence_count if st else 0,
-            "status": mastery_level(st.overall) if st and st.evidence_count > 0 else "untested",
+            "node_id": node.id,
+            "title": node.title,
+            "conceptual": state.conceptual if state else 0.0,
+            "procedural": state.procedural if state else 0.0,
+            "transfer": state.transfer if state else 0.0,
+            "overall": state.overall if state else 0.0,
+            "evidence_count": state.evidence_count if state else 0,
+            "status": mastery_level(state.overall) if tested else "untested",
         })
+
     return {
         "session_id": session.id,
         "stage": session.stage,
@@ -237,7 +234,8 @@ def progress(session_id: str, db: DbSession = Depends(get_db)):
 
 @app.get("/api/learning/{session_id}/events")
 def events(session_id: str, db: DbSession = Depends(get_db)):
-    """开发调试事件流。"""
+    if db.get(LearningSession, session_id) is None:
+        raise HTTPException(404, "session not found")
     rows = (
         db.query(Event)
         .filter(Event.session_id == session_id)
@@ -247,18 +245,19 @@ def events(session_id: str, db: DbSession = Depends(get_db)):
     )
     return [
         {
-            "id": e.id,
-            "event_type": e.event_type,
-            "payload": json.loads(e.payload_json),
-            "created_at": e.created_at.isoformat() if e.created_at else None,
+            "id": event.id,
+            "event_type": event.event_type,
+            "payload": json.loads(event.payload_json),
+            "created_at": event.created_at.isoformat() if event.created_at else None,
         }
-        for e in rows
+        for event in rows
     ]
 
 
 @app.get("/api/learning/{session_id}/messages")
 def messages(session_id: str, db: DbSession = Depends(get_db)):
-    """历史教学消息。"""
+    if db.get(LearningSession, session_id) is None:
+        raise HTTPException(404, "session not found")
     rows = (
         db.query(Message)
         .filter(Message.session_id == session_id)
@@ -266,8 +265,8 @@ def messages(session_id: str, db: DbSession = Depends(get_db)):
         .all()
     )
     return [
-        {"role": m.role, "content": m.content, "node_id": m.node_id}
-        for m in rows
+        {"role": message.role, "content": message.content, "node_id": message.node_id}
+        for message in rows
     ]
 
 
@@ -280,16 +279,18 @@ def health():
     }
 
 
-def _qdict(q) -> dict:
-    payload = json.loads(q.payload_json)
+def _qdict(question: Question | None) -> dict | None:
+    if question is None:
+        return None
+    payload = json.loads(question.payload_json)
     return {
-        "id": q.id,
-        "node_id": q.node_id,
-        "skill": q.skill,
-        "type": q.type,
+        "id": question.id,
+        "node_id": question.node_id,
+        "skill": question.skill,
+        "type": question.type,
         "question": payload["question"],
         "options": payload["options"],
-        "difficulty": q.difficulty,
+        "difficulty": question.difficulty,
     }
 
 
