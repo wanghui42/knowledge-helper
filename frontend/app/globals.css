@@ -13,6 +13,14 @@ body {
     system-ui,
     -apple-system,
     sans-serif;
+  background: #f8fafc;
+  color: #0f172a;
+}
+
+button,
+textarea,
+input {
+  font: inherit;
 }
 
 /* KaTeX 渲染优化 */
@@ -25,8 +33,13 @@ body {
 /* Mermaid 容器 */
 .mermaid-container {
   background: white;
-  border-radius: 0.5rem;
+  border-radius: 0.75rem;
   padding: 0.5rem;
+}
+
+.mermaid-container svg {
+  max-width: 100%;
+  height: auto;
 }
 
 /* 滚动条美化 */
@@ -34,10 +47,12 @@ body {
   width: 6px;
   height: 6px;
 }
+
 ::-webkit-scrollbar-thumb {
   background: #cbd5e1;
-  border-radius: 3px;
+  border-radius: 999px;
 }
+
 ::-webkit-scrollbar-track {
   background: transparent;
 }
